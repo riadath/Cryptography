@@ -2,14 +2,11 @@
 
 from DES import *
 import sys
- 
+
+# ./DES_text.py message.txt key.txt encrypted.txt 
+# ./DES_text.py encrypted.txt key.txt decrypted.txt
 
 def main():
-    # Script running command:
-    # python3 DES_text.py message.txt key.txt encrypted.txt
-    # python3 DES_text.py encrypted.txt key.txt decrypted.txt
-    
-    
     
     if len(sys.argv) != 4:
         print("Usage: python DES_text.py <input_file> <key_file> <output_file>")
