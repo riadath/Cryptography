@@ -32,7 +32,7 @@ async function KDF_RK(root_key, root_input) {
 async function KDF_CK(chain_key) {
   chain_key = await HMACtoHMACKey(chain_key, 'chain-key')
   const message_key = await HMACtoAESKey(chain_key, 'message-key')
-  const mk_buffer = await cryptoKeyToJSON(message_key)
+  const mk_buffer = await HMACtoAESKey(chain_key, 'message-key', true)
   return [chain_key, message_key, mk_buffer]
 
 }
@@ -133,7 +133,6 @@ class MessengerClient {
 
 
     if (current_conn.chain_key_sender == null) {
-      console.log("current_con: ", current_conn)
       var root_key = await computeDH(senderPrivateKey, receiverPublicKey)
       var eg_key = await generateEG()
       var root_input = await computeDH(eg_key.sec, receiverPublicKey)
@@ -146,10 +145,13 @@ class MessengerClient {
 
 
     const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_sender)
+    // console.log(mk_buffer)
     current_conn.chain_key_sender = chain_key
+    
     const IV = genRandomSalt()
     const gov_IV = genRandomSalt()
     const gov_DH = await generateEG()
+
     const gov_shared_key = await computeDH(gov_DH.sec, this.govPublicKey)
     const gov_aes_key = await HMACtoAESKey(gov_shared_key, govEncryptionDataStr)
     const cipherkey = await encryptWithGCM(gov_aes_key, mk_buffer, gov_IV)
