@@ -112,14 +112,8 @@ class MessengerClient {
       var root_key = await computeDH(senderPrivateKey, receiverPublicKey)
       var root_input = await computeDH(eg_key.sec, receiverPublicKey)
       var ck_sender = await KDF_RK(root_key, root_input)
-      ck_sender = ck_sender[0]
-      /*  
-      * 1. Generate a new DHs keypair (eg_key).
-      * 2. Compute the root key (root_key) using the sender's private key and the receiver's public key.
-      * 3. Compute the chain key for the sender (chain_key_sender) using the root key and the DHs keypair.
-      * 4. Store the DHs keypair, the receiver's public key, the root key, and the chain key for the sender in the connection data structure.
+      ck_sender = ck_sender[1]
 
-      */
       this.conns[name] = {
         DHsend_pair: eg_key, // DHs pair for sending chain
         DHreceive: receiverPublicKey, // reciver public key for receiving chain
@@ -141,7 +135,6 @@ class MessengerClient {
       current_conn.DHsend_pair = eg_key
       current_conn.chain_key_sender = ck_sender
     }
-
 
 
     const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_sender)
@@ -179,7 +172,56 @@ class MessengerClient {
  * Return Type: string
  */
   async receiveMessage(name, [header, ciphertext]) {
-    throw ('not implemented!')
+    const senderPublicKey = this.certs[name].publicKey
+    const receiverPrivateKey = this.EGKeyPair.sec
+    if(!(name in this.conns)){
+      var root_key = await computeDH(receiverPrivateKey, senderPublicKey)
+      var root_input = await computeDH(receiverPrivateKey, header.publicKey)
+      var ck_receiver = await KDF_RK(root_key, root_input)
+      ck_receiver = ck_receiver[1]
+
+      this.conns[name] = {
+        DHsend_pair: this.EGKeyPair, // DHs pair for sending chain
+        DHreceive: header.publicKey, // reciver public key for receiving chain
+        root_key_chain: root_key, // root key chain
+        chain_key_sender: null,
+        chain_key_receiver: ck_receiver
+      }
+    }
+
+    const current_conn = this.conns[name]
+
+    if(current_conn.chain_key_receiver == null){
+      var root_key = await computeDH(receiverPrivateKey, senderPublicKey)
+      var root_input = await computeDH(receiverPrivateKey, header.publicKey)
+      var ck_receiver = await KDF_RK(root_key, root_input)
+      ck_receiver = ck_receiver[1]
+      current_conn.chain_key_receiver = ck_receiver
+      current_conn.DHreceive = header.publicKey
+    }
+
+
+    if (header.publicKey != current_conn.DHreceive) {
+      // perform a DH ratchet step
+      current_conn.DHsend_pair = await generateEG()
+      current_conn.DHreceive = header.publicKey
+      var root_input = await computeDH(current_conn.DHsend_pair.sec, current_conn.DHreceive)
+      const [rk_receiver, ck_receiver] = await KDF_RK(
+        current_conn.root_key_chain,
+        root_input
+      )
+      current_conn.chain_key_receiver = ck_receiver
+      current_conn.DHsend_pair = await generateEG()
+
+      const [rk_sender, ck_sender] = await KDF_CK(current_conn.chain_key_sender)
+      current_conn.chain_key_sender = ck_sender
+    }
+
+
+    const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_receiver)
+    current_conn.chain_key_receiver = chain_key
+
+    const plaintext = bufferToString(await decryptWithGCM(message_key, ciphertext, header.receiverIV, JSON.stringify(header)))
     return plaintext
   }
 };
