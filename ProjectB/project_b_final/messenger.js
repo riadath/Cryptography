@@ -20,24 +20,6 @@ const {
   govEncryptionDataStr
 } = require('./lib')
 
-/** ******* Implementation ********/
-
-
-async function KDF_RK(root_key, root_input) {
-  const [rkBuf, chainKeyBuf] = await HKDF(root_key, root_input, 'ratchet-str')
-  return [rkBuf, chainKeyBuf]
-}
-
-
-async function KDF_CK(chain_key) {
-  chain_key = await HMACtoHMACKey(chain_key, 'chain-key')
-  const message_key = await HMACtoAESKey(chain_key, 'message-key')
-  const mk_buffer = await HMACtoAESKey(chain_key, 'message-key', true)
-  return [chain_key, message_key, mk_buffer]
-
-}
-
-
 
 
 class MessengerClient {
@@ -58,6 +40,42 @@ class MessengerClient {
     this.receiveCount = {}
 
     this.messageQueue = {}
+
+  }
+
+  // Helper functions  
+
+  async KDF_RK(root_key, root_input) {
+    const [rkBuf, chainKeyBuf] = await HKDF(root_key, root_input, 'ratchet-str')
+    return [rkBuf, chainKeyBuf]
+  }
+
+
+  async KDF_CK(chain_key) {
+    chain_key = await HMACtoHMACKey(chain_key, 'chain-key')
+    const message_key = await HMACtoAESKey(chain_key, 'message-key')
+    const mk_buffer = await HMACtoAESKey(chain_key, 'message-key', true)
+    return [chain_key, message_key, mk_buffer]
+
+  }
+
+  async performDHRatchetSender(private_key, public_key) {
+    var eg_key = await generateEG()
+    var root_key = await computeDH(private_key, public_key)
+    var root_input = await computeDH(eg_key.sec, public_key)
+    var ck = await this.KDF_RK(root_key, root_input)
+    ck = ck[1]
+
+    return [eg_key, root_key, ck]
+  }
+
+  async performDHRatchetReceiver(private_key, public_key, hd_pub_key) {
+    var root_key = await computeDH(private_key, public_key)
+    var root_input = await computeDH(private_key, hd_pub_key)
+    var ck = await this.KDF_RK(root_key, root_input)
+    ck = ck[1]
+
+    return [root_key, ck]
   }
 
   /**
@@ -113,11 +131,7 @@ class MessengerClient {
     const receiverPublicKey = this.certs[name].publicKey
     const senderPrivateKey = this.EGKeyPair.sec
     if (!(name in this.conns)) {
-      var eg_key = await generateEG()
-      var root_key = await computeDH(senderPrivateKey, receiverPublicKey)
-      var root_input = await computeDH(eg_key.sec, receiverPublicKey)
-      var ck_sender = await KDF_RK(root_key, root_input)
-      ck_sender = ck_sender[1]
+      var [eg_key, root_key, ck_sender] = await this.performDHRatchetSender(senderPrivateKey, receiverPublicKey)
 
       this.sendCount[name] = 0
 
@@ -131,14 +145,8 @@ class MessengerClient {
     }
 
     const current_conn = this.conns[name]
-
-
     if (current_conn.chain_key_sender == null) {
-      var root_key = await computeDH(senderPrivateKey, receiverPublicKey)
-      var eg_key = await generateEG()
-      var root_input = await computeDH(eg_key.sec, receiverPublicKey)
-      var ck_sender = await KDF_RK(root_key, root_input)
-      ck_sender = ck_sender[1]
+      var [eg_key, root_key, ck_sender] = await this.performDHRatchetSender(senderPrivateKey, receiverPublicKey)
       current_conn.DHsend_pair = eg_key
       current_conn.chain_key_sender = ck_sender
 
@@ -147,7 +155,8 @@ class MessengerClient {
     }
 
 
-    const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_sender)
+    const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_sender)
+
     current_conn.chain_key_sender = chain_key
 
     const IV = genRandomSalt()
@@ -157,6 +166,7 @@ class MessengerClient {
     const gov_shared_key = await computeDH(gov_DH.sec, this.govPublicKey)
     const gov_aes_key = await HMACtoAESKey(gov_shared_key, govEncryptionDataStr)
     const cipherkey = await encryptWithGCM(gov_aes_key, mk_buffer, gov_IV)
+    
     const header = {
       publicKey: current_conn.DHsend_pair.pub,
       receiverIV: IV,
@@ -189,15 +199,11 @@ class MessengerClient {
  * Return Type: string
  */
   async receiveMessage(name, [header, ciphertext]) {
-
     const senderPublicKey = this.certs[name].publicKey
     const receiverPrivateKey = this.EGKeyPair.sec
 
     if (!(name in this.conns)) {
-      var root_key = await computeDH(receiverPrivateKey, senderPublicKey)
-      var root_input = await computeDH(receiverPrivateKey, header.publicKey)
-      var ck_receiver = await KDF_RK(root_key, root_input)
-      ck_receiver = ck_receiver[1]
+      var [root_key, ck_receiver] = await this.performDHRatchetReceiver(receiverPrivateKey, senderPublicKey, header.publicKey)
 
       this.receiveCount[name] = 0
 
@@ -220,8 +226,8 @@ class MessengerClient {
     if (header.sendCount != this.receiveCount[name]) {
       var missed = header.sendCount - this.receiveCount[name]
       for (var i = 0; i < missed; i++) {
-        const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_receiver)
-        
+        const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
+
         if (name in this.messageQueue) {
           this.messageQueue[name][this.receiveCount[name]] = message_key
         } else {
@@ -247,10 +253,7 @@ class MessengerClient {
     }
 
     if (current_conn.chain_key_receiver == null) {
-      var root_key = await computeDH(receiverPrivateKey, senderPublicKey)
-      var root_input = await computeDH(receiverPrivateKey, header.publicKey)
-      var ck_receiver = await KDF_RK(root_key, root_input)
-      ck_receiver = ck_receiver[1]
+      var [root_key, ck_receiver] = await this.performDHRatchetReceiver(receiverPrivateKey, senderPublicKey, header.publicKey)
 
       current_conn.chain_key_receiver = ck_receiver
       current_conn.DHreceive = header.publicKey
@@ -261,7 +264,7 @@ class MessengerClient {
 
 
 
-    const [chain_key, message_key, mk_buffer] = await KDF_CK(current_conn.chain_key_receiver)
+    const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
     current_conn.chain_key_receiver = chain_key
 
     const plaintext = bufferToString(await decryptWithGCM(message_key, ciphertext, header.receiverIV, JSON.stringify(header)))
