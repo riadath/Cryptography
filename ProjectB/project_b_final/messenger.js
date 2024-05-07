@@ -41,6 +41,10 @@ class MessengerClient {
 
     this.messageQueue = {}
 
+    this.previousMessageType = null
+
+    this.previousN = 0
+
   }
 
   // Helper functions  
@@ -145,7 +149,11 @@ class MessengerClient {
     }
 
     const current_conn = this.conns[name]
+
+
+    var alreadyDHRatchetPerformed = false
     if (current_conn.chain_key_sender == null) {
+      alreadyDHRatchetPerformed = true
       var [eg_key, root_key, ck_sender] = await this.performDHRatchetSender(senderPrivateKey, receiverPublicKey)
       current_conn.DHsend_pair = eg_key
       current_conn.chain_key_sender = ck_sender
@@ -154,6 +162,15 @@ class MessengerClient {
 
     }
 
+    if (this.previousMessageType == 'recieve' && !alreadyDHRatchetPerformed) {
+      // perform a DH ratchet step
+      var [eg_key, root_key, ck_sender] = await this.performDHRatchetSender(senderPrivateKey, receiverPublicKey)
+
+      current_conn.chain_key_sender = ck_sender
+      current_conn.root_key_chain = root_key
+
+      this.previousN = this.receiveCount[name] - this.previousN
+    }
 
     const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_sender)
 
@@ -166,7 +183,7 @@ class MessengerClient {
     const gov_shared_key = await computeDH(gov_DH.sec, this.govPublicKey)
     const gov_aes_key = await HMACtoAESKey(gov_shared_key, govEncryptionDataStr)
     const cipherkey = await encryptWithGCM(gov_aes_key, mk_buffer, gov_IV)
-    
+
     const header = {
       publicKey: current_conn.DHsend_pair.pub,
       receiverIV: IV,
@@ -174,17 +191,17 @@ class MessengerClient {
       vGov: gov_DH.pub,
       cGov: cipherkey,
       sendCount: this.sendCount[name],
-
+      pn: this.previousN
     }
+
+
 
     const ciphertext = await encryptWithGCM(message_key, plaintext, IV, JSON.stringify(header))
 
-    if (name in this.sendCount) {
-      this.sendCount[name] += 1
-    }
-    else {
-      this.sendCount[name] = 1
-    }
+    this.sendCount[name] = this.sendCount[name] ? this.sendCount[name] + 1 : 1;
+
+
+    this.previousMessageType = 'send'
 
     return [header, ciphertext]
   }
@@ -199,6 +216,7 @@ class MessengerClient {
  * Return Type: string
  */
   async receiveMessage(name, [header, ciphertext]) {
+
     const senderPublicKey = this.certs[name].publicKey
     const receiverPrivateKey = this.EGKeyPair.sec
 
@@ -218,12 +236,61 @@ class MessengerClient {
 
     const current_conn = this.conns[name]
 
+    var alreadyDHRatchetPerformed = false
+    if (current_conn.chain_key_receiver == null) {
+      alreadyDHRatchetPerformed = true
+      var [root_key, ck_receiver] = await this.performDHRatchetReceiver(receiverPrivateKey, senderPublicKey, header.publicKey)
 
-    //test 19 : 
+      current_conn.chain_key_receiver = ck_receiver
+      current_conn.DHreceive = header.publicKey
+
+      this.receiveCount[name] = 0
+    }
+
+    var dhRatchetTriggered = false
+    if (this.previousMessageType == 'Send' && !alreadyDHRatchetPerformed) {
+      dhRatchetTriggered = true
+      // perform a DH ratchet step
+      var [root_key, ck_receiver] = await this.performDHRatchetReceiver(receiverPrivateKey, senderPublicKey, header.publicKey)
+
+      current_conn.chain_key_receiver = ck_receiver
+      current_conn.root_key_chain = root_key
+    }
 
 
+    // Extra Credit stuff
 
     if (header.sendCount != this.receiveCount[name]) {
+      if (dhRatchetTriggered) {
+        var prevMissed = this.previousN - this.receiveCount[name]
+        var currentMissed = header.sendCount 
+        for (var i = 0; i < prevMissed; i++) {
+          const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
+
+          if (name in this.messageQueue) {
+            this.messageQueue[name][this.receiveCount[name]] = message_key
+          } else {
+            this.messageQueue[name] = {}
+            this.messageQueue[name][this.receiveCount[name]] = message_key
+          }
+          current_conn.chain_key_receiver = chain_key
+          this.receiveCount[name] += 1
+        }
+
+        for (var i = 0; i < currentMissed; i++) {
+          const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
+
+          if (name in this.messageQueue) {
+            this.messageQueue[name][this.receiveCount[name]] = message_key
+          } else {
+            this.messageQueue[name] = {}
+            this.messageQueue[name][this.receiveCount[name]] = message_key
+          }
+          current_conn.chain_key_receiver = chain_key
+          this.receiveCount[name] += 1
+        }
+      }
+
       var missed = header.sendCount - this.receiveCount[name]
       for (var i = 0; i < missed; i++) {
         const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
@@ -240,26 +307,19 @@ class MessengerClient {
     }
 
 
-
     if (header.sendCount < this.receiveCount[name]) {
+
       // take message key from message queue
       const message_key = this.messageQueue[name][header.sendCount]
 
       const plaintext = bufferToString(await decryptWithGCM(message_key, ciphertext, header.receiverIV, JSON.stringify(header)))
 
-
+      this.previousMessageType = 'receive'
       return plaintext
 
     }
 
-    if (current_conn.chain_key_receiver == null) {
-      var [root_key, ck_receiver] = await this.performDHRatchetReceiver(receiverPrivateKey, senderPublicKey, header.publicKey)
 
-      current_conn.chain_key_receiver = ck_receiver
-      current_conn.DHreceive = header.publicKey
-
-      this.receiveCount[name] = 0
-    }
 
 
 
@@ -267,15 +327,14 @@ class MessengerClient {
     const [chain_key, message_key, mk_buffer] = await this.KDF_CK(current_conn.chain_key_receiver)
     current_conn.chain_key_receiver = chain_key
 
+
+
     const plaintext = bufferToString(await decryptWithGCM(message_key, ciphertext, header.receiverIV, JSON.stringify(header)))
 
 
-    if (name in this.receiveCount) {
-      this.receiveCount[name] += 1
-    }
-    else {
-      this.receiveCount[name] = 1
-    }
+    this.receiveCount[name] = this.receiveCount[name] ? this.receiveCount[name] + 1 : 1;
+
+    this.previousMessageType = 'receive'
 
     return plaintext
   }
